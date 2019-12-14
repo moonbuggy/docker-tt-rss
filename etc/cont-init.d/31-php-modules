@@ -1,0 +1,21 @@
+#!/usr/bin/with-contenv /bin/sh
+
+source /etc/tt-rss/cont-init-common
+
+# don't load PHP modules we don't need
+#
+source "$SQL_TYPE_FILE"
+
+if [ $SQL_TYPE == "pgsql" ]; then
+	log "Configuring for PostgreSQL."
+	rm -f /etc/php7/conf.d/01_mysqlnd.ini
+	rm -f /etc/php7/conf.d/02_mysqli.ini
+	rm -f /etc/php7/conf.d/02_pdo_mysql.ini
+elif [ $SQL_TYPE == "mysql" ]; then
+	log "Configuring for MySQL/MariaDB."
+	rm -f /etc/php7/conf.d/00_pgsql.ini
+	rm -f /etc/php7/conf.d/01_pdo_pgsql.ini
+else
+	log "ERROR: Invalid database type specified. Halting."
+	/etc/s6/init/init-stage3
+fi

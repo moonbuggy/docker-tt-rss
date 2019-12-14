@@ -1,0 +1,9 @@
+# data common between cont-init.d scripts
+#
+SQL_TYPE_FILE="/etc/tt-rss/sql-type"
+
+# log output function for cont-init.d
+#
+function log() {
+    echo "[${0##*/}] $1" >&2
+}

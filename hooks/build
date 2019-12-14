@@ -1,0 +1,15 @@
+#!/usr/bin/env sh
+
+case "${DOCKER_TAG}" in
+	latest|pgsql)
+		arg_string="--build-arg BUILD=pgsql --build-arg TT_DB_TYPE=pgsql"
+		;;
+	mysql)
+		arg_string="--build-arg BUILD=mysql --build-arg TT_DB_TYPE=mysql"
+		;;
+	both)
+		arg_string="--build-arg BUILD=both"
+		;;
+esac
+
+docker build ${arg_string} -t ${IMAGE_NAME} .

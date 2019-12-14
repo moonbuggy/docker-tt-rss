@@ -1,0 +1,136 @@
+#!/usr/bin/with-contenv /bin/sh
+
+DST_DIR=/var/www/html
+TTRSS_SRC=https://git.tt-rss.org/fox/tt-rss.git
+XACCEL_SRC=https://git.tt-rss.org/fox/ttrss-nginx-xaccel.git
+
+# update from repo at every start
+DO_UPDATE=true
+
+# git complains about access to /root/ when it's run as www-data,
+# changing the HOME environment variable fixes this
+HOME=/tmp
+
+# execute git as www-data so we don't need to worry about
+# permissions after an update
+function do_git() {
+	s6-setuidgid www-data git $@
+}
+
+
+source /etc/tt-rss/cont-init-common
+
+# decide whether or not to pull the latest TT-RSS from the source
+# repo every time the container starts
+#
+if [ ! -z ${TT_REPO_UPDATE+set} ]; then
+    case $TT_REPO_UPDATE in
+        true|True|TRUE|yes|Yes|YES|1|on|On|ON)
+            DO_UPDATE=true
+            ;;
+        false|False|FALSE|no|No|NO|0|off|Off|OFF)
+            DO_UPDATE=false
+            ;;
+    esac
+fi
+
+if ! $DO_UPDATE; then
+	log "Updates from repo are disabled."
+fi
+
+# check TT-RSS is installed or if updatable
+#
+if [ ! -d $DST_DIR ]; then
+	log "Installing TT-RSS:"
+	mkdir -p $DST_DIR
+	do_git clone $TTRSS_SRC $DST_DIR
+elif $DO_UPDATE; then
+	log "Updating TT-RSS:"
+	cd $DST_DIR
+	do_git config --replace-all core.filemode false
+	do_git reset --hard HEAD
+	do_git pull origin master
+fi
+
+# check if nginx_xaccel is installed or updatable
+#
+if [ ! -d $DST_DIR/plugins.local/nginx_xaccel ]; then
+	log "Installing nginx_naccel:"
+	do_git clone $XACCEL_SRC $DST_DIR/plugins.local/nginx_xaccel
+elif $DO_UPDATE; then
+	log "Updating nginx_naccel:"
+	cd $DST_DIR/plugins.local/nginx_xaccel
+	do_git config --replace-all core.filemode false
+	do_git reset --hard HEAD
+	do_git pull origin master
+fi
+
+#
+# configure TT-RSS using config.php
+#
+CONFIG_FILE="${DST_DIR}/config.php"
+
+if [ ! -s $CONFIG_FILE ]; then
+	cp ${CONFIG_FILE}-dist $CONFIG_FILE
+    cat >> $DST_DIR/config.php << EOF
+        define('NGINX_XACCEL_PREFIX', '/');
+EOF
+fi
+
+SELF_URL_PATH=$(echo $TT_URL_PATH | sed -e 's/[\/&]/\\&/g')
+source "$SQL_TYPE_FILE"
+
+sed \
+		-e "s/define('DB_TYPE'.*/define('DB_TYPE', '$SQL_TYPE');/" \
+		-e "s/define('DB_HOST'.*/define('DB_HOST', '$TT_DB_HOST');/" \
+		-e "s/define('DB_PORT'.*/define('DB_PORT', '$DB_PORT');/" \
+		-e "s/define('DB_USER'.*/define('DB_USER', '$TT_DB_USER');/" \
+		-e "s/define('DB_NAME'.*/define('DB_NAME', '$TT_DB_NAME');/" \
+		-e "s/define('DB_PASS'.*/define('DB_PASS', '$TT_DB_PASS');/" \
+		-e "s/define('PLUGINS'.*/define('PLUGINS', 'auth_internal, note, nginx_xaccel');/" \
+		-e "s/define('SELF_URL_PATH'.*/define('SELF_URL_PATH','$SELF_URL_PATH');/" \
+		-i $CONFIG_FILE
+
+
+#
+# add cron job to update feeds
+#
+
+# defaults if no environment variable is supplied
+minutes="*/15"
+hours="*"
+
+# convert input (minutes) into a cron string
+# randomize values where appropriate so multiple instances don't all hit servers at once
+#
+if [ ! -z ${TT_FEED_PERIOD+set} ] && [ $TT_FEED_PERIOD -gt 15 ]; then
+	minutes=$(shuf -i 0-59 -n 1)
+
+	# maximum period is one day
+	# convert values above this to this limit
+	if [ $TT_FEED_PERIOD -gt 1440 ]; then
+		hours=$(shuf -i 0-23 -n 1)
+	# periods between 1 and 24 hours are rounded to the nearest hour
+	elif [ $TT_FEED_PERIOD -ge 60 ]; then
+		round_hours=$(( ($TT_FEED_PERIOD + 30) / 60 ))
+		hours="*/${round_hours}"
+	else
+		minutes="*/${TT_FEED_PERIOD}"
+	fi
+fi
+
+CRON_STRING="$minutes $hours * * * /var/www/html/update.php --feeds >/dev/null 2>&1"
+
+echo "[${0##*/}] Adding cron job: ${CRON_STRING}" >&2
+
+(crontab -l ; echo "$CRON_STRING") | crontab -
+
+
+#
+# fix permissions
+#
+chmod -R 777 /var/www/html/cache/export
+chmod -R 777 /var/www/html/cache/images
+chmod -R 777 /var/www/html/cache/upload
+chmod -R 777 /var/www/html/feed-icons
+chmod -R 777 /var/www/html/lock

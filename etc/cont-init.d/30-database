@@ -1,0 +1,129 @@
+#!/usr/bin/with-contenv /bin/sh
+
+source /etc/tt-rss/cont-init-common
+
+# determine database type
+#
+if [ -f "$SQL_TYPE_FILE" ]; then
+	source "$SQL_TYPE_FILE"
+elif [ ! -z ${TT_DB_TYPE+set} ]; then
+	case $TT_DB_TYPE in
+		pgsql|PGSQL|postgres|POSTGRES|postgrestql|POSTGRESQL)
+            SQL_TYPE="pgsql"
+			;;
+		mysql|MYSQL|maria|MARIA|mariadb|MARIADB)
+			SQL_TYPE="mysql"
+			;;
+		*)
+			log "ERROR: Invalid database type provided ('${TT_DB_TYPE}'). Halting."
+			/etc/s6/init/init-stage3
+			;;
+	esac
+	echo "SQL_TYPE=\"${SQL_TYPE}\"" > $SQL_TYPE_FILE
+else
+	log "ERROR: No database configured. Halting."
+	/etc/s6/init/init-stage3
+fi
+
+
+# check for a custom admin user/pass and configure appropriate data
+# ready for insertion into the database
+#
+if [ ! -z ${TT_ADMIN_USER+set} ]; then
+	admin_user="${TT_ADMIN_USER}"
+	if [ ! -z ${TT_ADMIN_PASS+set} ]; then
+		admin_pass="${TT_ADMIN_PASS}"
+	else
+		log "No TT_ADMIN_PASS set, using 'password'."
+		admin_pass="password"
+	fi
+else
+	log "No TT_ADMIN_USER set, using defaults."
+	admin_user="admin"
+	admin_pass="password"
+fi
+
+salt=`head /dev/urandom | tr -dc A-Za-z0-9 | head -c 16 ; echo ''`
+hash=`echo -n ${salt}${admin_pass} | sha256sum | awk '{print $1}'`
+
+
+# configure database connection, wait for database to be ready before
+# proceeding or halt if configuration is invalid
+#
+if [ ! -z ${TT_DB_PORT+set} ]; then
+	DB_PORT=$TT_DB_PORT
+fi
+
+if [ $SQL_TYPE == "pgsql" ]; then
+	log "Configuring for PostgreSQL."
+	if [ -z ${DB_PORT+set} ]; then
+		DB_PORT=5432
+	fi
+	export PGPASSWORD=$TT_DB_PASS
+	SQL_PARAMS="--quiet --host=${TT_DB_HOST} --port=${DB_PORT} --username=${TT_DB_USER}"
+	SQL_CMD="psql $SQL_PARAMS $TT_DB_NAME"
+	SQL_QUERY="$SQL_CMD -c"
+	SQL_READY_CMD="pg_isready $SQL_PARAMS"
+	read -r -d '' SQL_SET_USER <<EOF
+INSERT INTO ttrss_users (id, login, pwd_hash, salt, access_level, otp_enabled)
+	VALUES ('1',
+		'${admin_user}',
+		'MODE2:${hash}',
+		'${salt}',
+		'10',
+		false)
+ON CONFLICT (id) DO UPDATE
+	SET
+		login='${admin_user}',
+		pwd_hash='MODE2:${hash}',
+		salt = '${salt}',
+		access_level = '10',
+		otp_enabled = false;
+
+EOF
+elif [ $SQL_TYPE == "mysql" ]; then
+	log "Configuring for MySQL/MariaDB."
+	if [ -z ${DB_PORT+set} ]; then
+		DB_PORT=3306
+	fi
+	SQL_PARAMS="--silent --host=${TT_DB_HOST} --port=${DB_PORT} --user=${TT_DB_USER} --password=${TT_DB_PASS}"
+	SQL_CMD="mysql $SQL_PARAMS $TT_DB_NAME"
+	SQL_QUERY="$SQL_CMD -e"
+	SQL_READY_CMD="mysqladmin ping $SQL_PARAMS"
+	read -r -d '' SQL_SET_USER <<EOF
+INSERT INTO ttrss_users (id, login, pwd_hash, salt, access_level, otp_enabled)
+	VALUES ('1',
+		'${admin_user}',
+		'MODE2:${hash}',
+		'${salt}',
+		'10',
+		false)
+ON DUPLICATE KEY UPDATE
+		login='${admin_user}',
+		pwd_hash='MODE2:${hash}',
+		salt = '${salt}',
+		access_level = '10',
+		otp_enabled = false;
+
+EOF
+fi
+
+while ! $SQL_READY_CMD >/dev/null 2>&1; do
+	log "Waiting until $TT_DB_HOST is ready.."
+	sleep 3
+done
+
+if [ "$SQL_TYPE" == "pgsql" ]; then
+	if ! $SQL_QUERY select * from pg_extension where extname='pg_trgm' >/dev/null 2>&1; then
+		log "Creating pg_trgm extension.."
+		$SQL_QUERY 'create extension if not exists pg_trgm' >/dev/null 2>&1
+	fi
+fi
+
+if ! $SQL_QUERY 'select * from ttrss_version' >/dev/null 2>&1; then
+	log "Updating database schema.."
+	$SQL_CMD < /var/www/html/schema/ttrss_schema_${SQL_TYPE}.sql
+fi
+
+$SQL_QUERY "$SQL_SET_USER"
+
